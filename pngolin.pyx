@@ -10,8 +10,31 @@ import time
 cimport numpy as np
 cimport cython
 
-from cython.parallel cimport prange
+from cython.parallel cimport prange, parallel
 from libc.math cimport sqrt, pow, sin, pi, abs,  lround
+
+
+################################################################################
+# Parallel testing routines
+################################################################################
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
+def test_sum(int N, int num_threads):
+    """
+    Simple sum function
+    """
+    
+    cdef int i, tot
+
+    tot = 0
+    start = time.time()
+    for i in prange(N, nogil=True, num_threads=num_threads):
+        tot += i
+    end = time.time()
+    print(end-start)
+    return tot
+
 
 ################################################################################
 # Fourier transform routines
@@ -502,12 +525,16 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 
     ng = delta_k.shape[0]
     middle = ng//2
+#    print("\n\n\nNTHREAD")
+#    print(openmp.omp_get_num_threads())
 
     if verbose: 
         start = time.time()
-        print("1. COMPUTING POWER SPECTRUM")
+        print("1. COMPUTING POWER SPECTRUM WITH {} THREADS".format(nthreads))
+
         if nthreads>1:
             print("-> WARNING: nthreads is greater than 1. This can bias the estimator")
+
         print("-> {} bins".format(Nk))
 
     # Loop over momentum bins
