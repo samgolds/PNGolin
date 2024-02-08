@@ -122,6 +122,56 @@ def IFFT3Dr_f(np.complex64_t[:,:,::1] a, int nthreads):
     return a_out
 
 
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
+def get_RFFT_mask(int ng, int nthreads):
+    """
+    Function that computes a mask for RFFTs that only counts kz=0 modes
+    once. This is useful for computing sums over elements in RFFTs.
+
+    Parameters
+    ----------
+    ng: integer
+        Number of grid points on real space grid
+    nthreads: integer
+        Number of threads for the outer loop over grid indices and for FFTs.
+
+    Returns
+    -------
+    RFFT_mask: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field that is one for modes with kz=0 and kx,ky>0
+        and zero otherwise.
+    """
+
+    cdef int i, j, k, ki, kj, kk, middle
+    cdef np.uint8_t[:,:,::1] RFFT_mask
+
+    middle = ng//2 
+    
+    # Initialize output arrays
+    RFFT_mask     = np.zeros((ng, ng, middle+1), dtype=np.uint8)
+
+    # Loop over field and pick values in [k_min, k_max)
+    for i in prange(ng,  nogil=True, num_threads=nthreads):
+        ki = (i-ng if (i>middle) else i)
+        for j in range(ng):
+            kj = (j-ng if (j>middle) else j)
+                
+            for k in range(middle+1): 
+                kk = (k-ng if (k>middle) else k)
+
+                # kz=0 and kz=middle planes should only be counted once
+                if kk==0 or (kk==middle and ng%2==0):
+                    if ki<0: continue
+                    elif ki==0 or (ki==middle and ng%2==0):
+                        if kj<0.0: continue
+
+                RFFT_mask[i,j,k] = 1
+    
+    return RFFT_mask
+
+
 ################################################################################
 # Density Field Manipulations
 ################################################################################
@@ -194,55 +244,147 @@ def initialize_delta(np.ndarray[np.float32_t,ndim=3] delta, MAS, int nthreads):
 
     return delta_k
 
+
 @cython.boundscheck(False)
 @cython.cdivision(False)
 @cython.wraparound(False)
-def get_RFFT_mask(int ng, int nthreads):
+def pick_field(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max, 
+               int nthreads, double alpha=0, return_k_bin=False):
     """
-    Function that computes a mask for RFFTs that only counts kz=0 modes
-    once. This is useful for computing sums over elements in RFFTs.
+    Function that picks modes within a Fourier space density field delta_k 
+    in interval [k_min, k_max). Note that k_min and k_max are in units of the 
+    fundamental frequency. 
 
     Parameters
     ----------
-    ng: integer
-        Number of grid points on real space grid
+    delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field.
+    k_min: int
+        Minimum wave number in units of kf.
+    k_max: int 
+        Maximum wave number in units of kf.
     nthreads: integer
         Number of threads for the outer loop over grid indices and for FFTs.
+    alpha: integer (optional)
+        Optional power alpha to have momentum weighted density fields. This
+        is used to compute the momentum weighted spectra such as 
+        <q^(2alpha) deltaq delta_{-q}> in the theory model.
+    return_k_bin: bool (optional)
+        Optional argument to specify whether or not to return the average k_bin
+        used in this picked field. This can be used to better estimate the bin
+        centers when comparing with theory.
 
     Returns
     -------
-    RFFT_mask: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field that is one for modes with kz=0 and kx,ky>0
-        and zero otherwise.
+    delta_picked: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field that includes only modes in [k_min, k_max).
+    I_picked: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space field that has value 1 for modes in [k_min, k_max) and 
+        0 otherwise. This is used for normalizing pngolin calculations.
+    k_bin: optional float
+        If return_k_bin is True, then return the average value of k used in this
+        FFT. This NEEDS to be rescaled in units of kf and normalized by Nmodes
+        for actual computations. See the power spectrum routine for how this is
+        done. 
     """
 
-    cdef int i, j, k, ki, kj, kk, middle
-    cdef np.uint8_t[:,:,::1] RFFT_mask
+    cdef float knorm, k_bin, tot
+    cdef int ng, i, j, k, ki, kj, kk, middle
+    cdef np.complex64_t[:,:,::1] delta_picked, I_picked
 
+    ng     =  delta_k.shape[0]
     middle = ng//2 
     
     # Initialize output arrays
-    RFFT_mask     = np.zeros((ng, ng, middle+1), dtype=np.uint8)
+    k_bin, tot   = 0.0, 0.0
+    delta_picked = np.zeros_like(delta_k)
+    I_picked     = np.zeros((ng, ng, middle+1), dtype=np.complex64)
 
     # Loop over field and pick values in [k_min, k_max)
     for i in prange(ng,  nogil=True, num_threads=nthreads):
         ki = (i-ng if (i>middle) else i)
+        if(ki>k_max): continue
+        
         for j in range(ng):
             kj = (j-ng if (j>middle) else j)
+            if(kj>k_max): continue
                 
             for k in range(middle+1): 
                 kk = (k-ng if (k>middle) else k)
+                if(kk>k_max): continue
 
-                # kz=0 and kz=middle planes should only be counted once
+                knorm = sqrt(ki*ki+kj*kj+kk*kk)
+                if(knorm<k_min or knorm>=k_max): continue
+
+                delta_picked[i,j,k] = delta_k[i,j,k]*pow(knorm, alpha)
+                I_picked[i,j,k]     = 1
+
+
+                # kz=0 and kz=middle planes should not be included in any
+                # sums computed over real FFTs
                 if kk==0 or (kk==middle and ng%2==0):
                     if ki<0: continue
                     elif ki==0 or (ki==middle and ng%2==0):
                         if kj<0.0: continue
 
-                RFFT_mask[i,j,k] = 1
+                k_bin += knorm
+                tot   += 1
     
-    return RFFT_mask
+    if return_k_bin:
+        k_bin = k_bin/tot
+        return delta_picked, I_picked, k_bin
+    else:
+        return delta_picked, I_picked
 
+
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
+def construct_pi_giri(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max, 
+                      int nthreads):
+    """
+    Constructs pi fields from https://arxiv.org/abs/2305.03070. These fields are
+    meant to encapsulate an auxiliary field weighted by the local small-scale
+    power spectrum. The precise definition of the auxiliary field is:
+        pi(x) = (int d^3k/(2pi)^3 W^i(k)rho(k) e^{ikx})^2
+
+    Parameters
+    ----------
+    delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field.
+    k_min: int
+        Minimum wave number in units of kf.
+    k_max: int 
+        Maximum wave number in units of kf.
+    nthreads: integer
+        Number of threads for the outer loop over grid indices and for FFTs.
+
+    Returns #UPDATE THIS
+    -------
+    delta_picked: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field that includes only modes in [k_min, k_max).
+    """
+
+    cdef int ng, i, j, k
+    cdef np.complex64_t[:,:,::1] delta_picked
+    cdef np.float32_t[:,:,::1] deltax_picked, pix_picked
+
+    # Useful quantitites
+    ng     =  delta_k.shape[0]
+
+    # Get filtered density field W^{i}(k)delta(k)
+    delta_picked = pick_field(delta_k, k_min, k_max, nthreads)[0]
+
+    # Compute IFFT
+    deltax_picked = IFFT3Dr_f(delta_picked, nthreads)
+    pix_picked = np.zeros((ng, ng, ng), dtype=np.float32)
+
+    for i in range(ng):
+        for j in range(ng):
+            for k in range(ng):
+                pix_picked[i,j,k] = pow(deltax_picked[i,j,k], 2)
+
+    return pix_picked
 
 @cython.boundscheck(False)
 @cython.cdivision(False)
@@ -297,99 +439,6 @@ def construct_Pk_mesh(int ng, Pk_interp, double box_len, int nthreads):
                 Pk_mesh[i,j,k] = Pk_interp(knorm)#+0j
 
     return Pk_mesh
-
-
-@cython.boundscheck(False)
-@cython.cdivision(False)
-@cython.wraparound(False)
-def pick_field(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max, 
-               int nthreads, double alpha=0, return_k_bin=False):
-    """
-    Function that picks modes within a Fourier space density field delta_k 
-    in interval [k_min, k_max). Note that k_min and k_max are in units of the 
-    fundamental frequency. 
-
-    Parameters
-    ----------
-    delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field.
-    k_min: int
-        Minimum wave number in units of kf.
-    k_max: int 
-        Maximum wave number in units of kf.
-    nthreads: integer
-        Number of threads for the outer loop over grid indices and for FFTs.
-    alpha: integer (optional)
-        Optional power alpha to have momentum weighted density fields. This
-        is used to compute the momentum weighted spectra such as 
-        <q^(2alpha) deltaq delta_{-q}> in the theory model.
-    return_k_bin: bool (optional)
-        Optional argument to specify whether or not to return the average k_bin
-        used in this picked field. This can be used to better estimate the bin
-        centers when comparing with theory.
-
-    Returns
-    -------
-    delta_picked: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field that includes only modes in [k_min, k_max).
-    I_picked: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space field that has value 1 for modes in [k_min, k_max) and 
-        0 otherwise. This is used for normalizing pngolin calculations.
-    k_bin: optional float
-        If return_k_bin is True, then return the average value of k used in this
-        FFT. This NEEDS to be rescaled in units of kf and normalized by Nmodes
-        for actual computations. See the power spectrum routine for how this is
-        done. 
-    """
-
-    cdef float knorm, k_bin, tot # CHANGED FROM DOUBULE
-    cdef int ng, i, j, k, ki, kj, kk, middle
-    cdef np.complex64_t[:,:,::1] delta_picked, I_picked
-
-    ng     =  delta_k.shape[0]
-    middle = ng//2 
-    
-    # Initialize output arrays
-    k_bin, tot   = 0.0, 0.0
-    delta_picked = np.zeros_like(delta_k)
-    I_picked     = np.zeros((ng, ng, middle+1), dtype=np.complex64)
-
-    # Loop over field and pick values in [k_min, k_max)
-    for i in prange(ng,  nogil=True, num_threads=nthreads):
-        ki = (i-ng if (i>middle) else i)
-        if(ki>k_max): continue
-        
-        for j in range(ng):
-            kj = (j-ng if (j>middle) else j)
-            if(kj>k_max): continue
-                
-            for k in range(middle+1): 
-                kk = (k-ng if (k>middle) else k)
-                if(kk>k_max): continue
-
-                knorm = sqrt(ki*ki+kj*kj+kk*kk)
-                if(knorm<k_min or knorm>=k_max): continue
-
-                delta_picked[i,j,k] = delta_k[i,j,k]*pow(knorm, alpha)
-                I_picked[i,j,k]     = 1
-
-
-                # kz=0 and kz=middle planes should not be included in any
-                # sums computed over real FFTs
-                if kk==0 or (kk==middle and ng%2==0):
-                    if ki<0: continue
-                    elif ki==0 or (ki==middle and ng%2==0):
-                        if kj<0.0: continue
-
-                k_bin += knorm
-                tot   += 1
-    
-    if return_k_bin:
-        k_bin = k_bin/tot
-        return delta_picked, I_picked, k_bin
-    else:
-        return delta_picked, I_picked
-
 
 ################################################################################
 # Power spectrum routines
@@ -469,6 +518,88 @@ def compute_Pk3D_single(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 @cython.boundscheck(False)
 @cython.cdivision(False)
 @cython.wraparound(False)
+def compute_xPk3D_single(np.complex64_t[:,:,::1] delta_ka, 
+                         np.complex64_t[:,:,::1] delta_kb, int k_min, int k_max,
+                         double box_len, int nthreads,  double alpha=0):
+    """
+    Computes 3D auto power power spectrum of a density field in a single bin 
+    between [k_min, k_max) where k_min and k_max are in units of kf.
+
+    Parameters
+    ----------
+    delta_ka: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field.
+    delta_kb: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field.
+    k_min: int
+        Minimum wave number in units of kf=2pi/box_len.
+    k_max: int 
+        Maximum wave number in units of kf=2pi/box_len.
+    box_len: float 
+        Length of the box (typically in units of Mpc/h or Mpc). This sets the 
+        dimensions of the power spectrum as well as the fundamental frequency.
+    alpha: float (optional; default 0)
+        Optional float that allows for momentum weighted power spectra. Used 
+        in squeezed bispectrum modelling.
+    nthreads: integer
+        Number of threads for the outer loop over grid indices and for FFTs.
+
+    Returns
+    -------
+    k_bin: float
+        Average value of all Fourier modes used in this bin in units of 
+        1/box_len~h/Mpc.
+    Pk: float
+        Power spectrum in units of [Vol]=[box_len]^3~(Mpc/h)^3.
+    Nmodes: float
+        Number of modes in the Fourier bin. Technically this should be an
+        integer, but we keep it as a float.
+    """
+
+    cdef int ng, i, j, k
+    cdef double signal, pairs, Pk, Nmodes, k_bin
+    cdef np.complex64_t[:,:,::1] delta_ka_k1, delta_kb_k1, Ik1 # Fourier space fields
+    cdef np.float32_t[:,:,::1] delta_xa_k1, delta_xb_k1, Ix1      # Real space fields
+
+    ng   = delta_ka.shape[0]
+    delta_ka_k1, Ik1, k_bin = pick_field(delta_ka, k_min, k_max, nthreads, 
+                                         alpha=alpha/2, return_k_bin=True)
+    delta_kb_k1, _, _ = pick_field(delta_kb, k_min, k_max, nthreads, 
+                                   alpha=alpha/2, return_k_bin=True)
+    
+    del delta_ka, delta_kb
+
+    # Compute FFT
+    delta_xa_k1 = IFFT3Dr_f(delta_ka_k1, nthreads)
+    del delta_ka_k1
+    delta_xb_k1 = IFFT3Dr_f(delta_kb_k1, nthreads)
+    del delta_kb_k1
+    Ix1     = IFFT3Dr_f(Ik1, nthreads)
+    del Ik1
+
+    # Calculate sum and normalization
+    signal, pairs = 0.0, 0.0
+
+    for i in prange(ng, nogil=True, num_threads=nthreads):
+        for j in range(ng):
+            for k in range(ng):
+                signal += (delta_xa_k1[i,j,k]*delta_xb_k1[i,j,k])
+                pairs  += (Ix1[i,j,k]*Ix1[i,j,k])
+    
+    # Clean up
+    del delta_xa_k1, delta_xa_k1, Ix1
+
+    # Normalize results 
+    Pk     = (signal/pairs)*(box_len/ng**2)**3
+    norm   = pairs # Factor of 2 because real space double counts kz 
+    k_bin  = k_bin*(2*pi/box_len)
+    
+    return k_bin, Pk, pairs
+
+
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
 def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
                         int dk, double box_len, int nthreads, double alpha=0,
                         verbose=False):
@@ -525,8 +656,6 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 
     ng = delta_k.shape[0]
     middle = ng//2
-#    print("\n\n\nNTHREAD")
-#    print(openmp.omp_get_num_threads())
 
     if verbose: 
         start = time.time()
@@ -559,8 +688,121 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 
                 if 0<=k_ind<Nk:
                     k_arr[k_ind] += knorm
-                    Pk_arr[k_ind] += ((delta_k[i,j,k].real)**2+
-                                      (delta_k[i,j,k].imag)**2)*pow(knorm, alpha)
+                    Pk_arr[k_ind] += (pow(delta_k[i,j,k].real, 2)+
+                                      pow(delta_k[i,j,k].imag, 2))*pow(knorm, alpha)
+                    Nmodes_arr[k_ind] += 1
+
+    k_arr  = kf*k_arr/Nmodes_arr
+    Pk_arr = (Pk_arr/Nmodes_arr)*(box_len/ng**2)**3
+
+    # Need to multiply by kf^alpha for momentum weighted spectra.
+    Pk_arr = Pk_arr*pow(kf, alpha)
+
+    if verbose:
+        end = time.time()
+        print("-> Time taken: {:.3f} seconds".format(end-start))
+
+    return k_arr, Pk_arr, Nmodes_arr
+
+
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
+def compute_xPk3D_binned(np.complex64_t[:,:,::1] delta_k_a,
+                         np.complex64_t[:,:,::1] delta_k_b, int k_min, int k_max,
+                        int dk, double box_len, int nthreads, double alpha=0,
+                        verbose=False):
+    """
+    Computes 3D cross power spectrum of two density fields in bins between
+    k_min and k_max with spacing dk. 
+    Note: k_min, k_max, and dk are all in units of fundamental frequency.
+
+    Parameters
+    ----------
+    delta_k_a: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        First Fourier space density field.
+    delta_k_b: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Second Fourier space density field.
+    k_min: int
+        Minimum wave number in units of kf=2pi/box_len.
+    k_max: int 
+        Maximum wave number in units of kf=2pi/box_len.
+    box_len: float 
+        Length of the box (typically in units of Mpc/h or Mpc). This sets the 
+        dimensions of the power spectrum as well as the fundamental frequency.
+    nthreads: integer
+        Number of threads for the outer loop over grid indices and for FFTs.
+    alpha: float (optional; default 0)
+        Optional float that allows for momentum weighted power spectra. Used 
+        in squeezed bispectrum modelling.
+    verbose: bool (optional; default False)
+        Sets verbosity
+
+    Returns
+    -------
+    k_cen_arr: float array
+        Bin center of the power spectrum. This is simply the midpoint of the
+        bin. More sophisticated treatment of binning could be necessary at 
+        low k to mitigate binning effects. Units of 1/[box_len]~h/Mpc.
+    Pk: float array
+        Power spectrum in units of [Vol]=[box_len]^3~(Mpc/h)^3.
+    Nmodes: float array
+        Number of modes in the Fourier bin. Technically this should be an
+        integer, but we keep it as a float.
+    """
+
+    cdef int Nk, ng, middle, i, j, k, k_ind, ki, kj, kk
+    cdef double  kf, knorm, start, end
+    cdef np.ndarray[np.int64_t, ndim=1] k_min_arr, k_max_arr 
+    cdef np.ndarray[np.float64_t, ndim=1] k_arr, Pk_arr, Nmodes_arr
+
+    # Initialize data products
+    kf         = 2*pi/box_len
+    k_min_arr  = np.arange(k_min, k_max, dk, dtype=np.int64) # Lower bin values (units of kf)
+    k_max_arr  = k_min_arr+dk
+    Nk         = len(k_min_arr)
+    k_arr      = np.zeros(Nk, dtype=np.float64)
+    Pk_arr     = np.zeros(Nk, dtype=np.float64)
+    Nmodes_arr = np.zeros(Nk, dtype=np.float64)
+
+    ng = delta_k_a.shape[0]
+    middle = ng//2
+
+    assert delta_k_a.shape != delta_k_b.shape, "Input fields must have same dimensions."
+
+    if verbose: 
+        start = time.time()
+        print("1. COMPUTING CROSS POWER SPECTRUM WITH {} THREADS".format(nthreads))
+
+        if nthreads>1:
+            print("-> WARNING: nthreads is greater than 1. This can bias the estimator")
+
+        print("-> {} bins".format(Nk))
+
+    # Loop over momentum bins
+    for i in prange(ng,nogil=True, num_threads=nthreads):
+        ki = (i-ng if (i>middle) else i)
+        
+        for j in range(ng):
+            kj = (j-ng if (j>middle) else j)
+                
+            for k in range(middle+1):
+                kk = (k-ng if (k>middle) else k)
+
+                if kk==0 or (kk==middle and ng%2==0):
+                    if ki<0: continue
+                    elif ki==0 or (ki==middle and ng%2==0):
+                        if kj<0.0: continue
+
+                knorm = sqrt(ki*ki+kj*kj+kk*kk)
+
+                # Get index
+                k_ind = lround((knorm-k_min)/dk-0.499999)
+
+                if 0<=k_ind<Nk:
+                    k_arr[k_ind] += knorm
+                    Pk_arr[k_ind] += ((delta_k_a[i,j,k].real*delta_k_b[i,j,k].real)+
+                                      (delta_k_a[i,j,k].imag*delta_k_b[i,j,k].imag))*pow(knorm, alpha)
                     Nmodes_arr[k_ind] += 1
 
     k_arr  = kf*k_arr/Nmodes_arr
@@ -630,8 +872,8 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
     # Define Fourier and real space fields
     cdef np.ndarray[np.float32_t, ndim=1] k_cen_uniq     
     cdef np.ndarray[np.complex64_t, ndim=4] Wk_uniq, deltak_uniq
-    cdef np.ndarray[np.float32_t, ndim=4] Wr_uniq, deltar_uniq
-    cdef np.float32_t[:,:,::1] deltar_k1, Wr_k1, deltar_k2, Wr_k2, deltar_k3, Wr_k3 
+    cdef np.ndarray[np.float32_t, ndim=4] Wr_uniq, deltax_uniq
+    cdef np.float32_t[:,:,::1] deltax_k1, Wr_k1, deltax_k2, Wr_k2, deltax_k3, Wr_k3 
 
     # Compute constants and useful variables
     ng     = delta_k.shape[0]
@@ -695,7 +937,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
         k_cen_uniq  = np.empty(N_uniq, dtype=np.float32)
         deltak_uniq = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
         Wk_uniq     = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
-        deltar_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
+        deltax_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
         Wr_uniq     = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
 
         # Compute all necessary real space fields
@@ -704,7 +946,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
             Wk_uniq[i]     = np.asarray(Wk_i)
             Wr_uniq[i]     = IFFT3Dr_f(Wk_uniq[i], nthreads)
             deltak_uniq[i] = np.asarray(deltak_i)
-            deltar_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
+            deltax_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
             
         del Wk_uniq, deltak_uniq
 
@@ -731,9 +973,9 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                                         k_cen_uniq[k3_ind]])*kf
             
             # Get correct fields
-            deltar_k1 = deltar_uniq[k1_ind]
-            deltar_k2 = deltar_uniq[k2_ind]
-            deltar_k3 = deltar_uniq[k3_ind] 
+            deltax_k1 = deltax_uniq[k1_ind]
+            deltax_k2 = deltax_uniq[k2_ind]
+            deltax_k3 = deltax_uniq[k3_ind] 
             Wr_k1 = Wr_uniq[k1_ind]
             Wr_k2 = Wr_uniq[k2_ind]
             Wr_k3 = Wr_uniq[k3_ind]
@@ -746,7 +988,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                 for j in range(ng):
                     for k in range(ng):
 
-                        signal += (deltar_k1[i,j,k]*deltar_k2[i,j,k]*deltar_k3[i,j,k])         
+                        signal += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])         
                         Ntri += (Wr_k1[i,j,k]*Wr_k2[i,j,k]*Wr_k3[i,j,k])
 
             Bk_arr[ik]   = signal/Ntri*pow(box_len/ng, 6)/pow(ng, 3)
@@ -767,14 +1009,14 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
 
         k_cen_uniq  = np.empty(N_uniq, dtype=np.float32)
         deltak_uniq = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
-        deltar_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
+        deltax_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
 
         # Compute all necessary real space fields
         for i in (range(N_uniq)):
             deltak_i, _, k_cen_uniq[i] = pick_field(delta_k, *k_bounds_uniq[i], nthreads, return_k_bin=True) 
             
             deltak_uniq[i] = np.asarray(deltak_i)
-            deltar_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
+            deltax_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
             
         del deltak_uniq
 
@@ -800,9 +1042,9 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                                         k_cen_uniq[k3_ind]])*kf
             
             # Get correct fields
-            deltar_k1 = deltar_uniq[k1_ind]
-            deltar_k2 = deltar_uniq[k2_ind]
-            deltar_k3 = deltar_uniq[k3_ind] 
+            deltax_k1 = deltax_uniq[k1_ind]
+            deltax_k2 = deltax_uniq[k2_ind]
+            deltax_k3 = deltax_uniq[k3_ind] 
 
             # Compute sum in real space
             signal = 0.0
@@ -810,7 +1052,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
             for i in prange(ng,nogil=True, num_threads=nthreads): 
                 for j in range(ng):
                     for k in range(ng):
-                        signal += (deltar_k1[i,j,k]*deltar_k2[i,j,k]*deltar_k3[i,j,k])         
+                        signal += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])         
 
             Bk_arr[ik]   = signal*pow(box_len/ng, 6)/pow(ng, 3)
 
@@ -875,7 +1117,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
     # Define Fourier and real space fields
     cdef np.complex64_t[:,:,::1] delta_k1, I_k1, delta_k2, I_k2, delta_k3, I_k3 
-    cdef np.float32_t[:,:,::1] deltar_k1, Ir_k1, deltar_k2, Ir_k2, deltar_k3, Ir_k3 
+    cdef np.float32_t[:,:,::1] deltax_k1, Ix_k1, deltax_k2, Ix_k2, deltax_k3, Ix_k3 
 
     # Initialize data products
     ng         = delta_k.shape[0]
@@ -893,13 +1135,13 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
         # k_min<k2<k_max
         delta_k2, I_k2 = pick_field(delta_k, k_min, k_max, nthreads)
-        deltar_k2 = IFFT3Dr_f(delta_k2, nthreads); del delta_k2
-        Ir_k2     = IFFT3Dr_f(I_k2, nthreads); del I_k2
+        deltax_k2 = IFFT3Dr_f(delta_k2, nthreads); del delta_k2
+        Ix_k2     = IFFT3Dr_f(I_k2, nthreads); del I_k2
 
         # 0<k3<inf
         delta_k3, I_k3 = pick_field(delta_k, k3_min, k3_max, nthreads)
-        deltar_k3 = IFFT3Dr_f(delta_k3, nthreads); del delta_k3
-        Ir_k3     = IFFT3Dr_f(I_k3, nthreads); del I_k3
+        deltax_k3 = IFFT3Dr_f(delta_k3, nthreads); del delta_k3
+        Ix_k3     = IFFT3Dr_f(I_k3, nthreads); del I_k3
 
         # Loop over soft modes
         for q_ind in (range(Nq)):
@@ -908,16 +1150,16 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
             delta_k1, I_k1, k1 = pick_field(delta_k, q_min_arr[q_ind], 
                                             q_min_arr[q_ind]+dq, nthreads,
                                             return_k_bin=True)
-            deltar_k1 = IFFT3Dr_f(delta_k1, nthreads); del delta_k1
-            Ir_k1     = IFFT3Dr_f(I_k1, nthreads); del I_k1
+            deltax_k1 = IFFT3Dr_f(delta_k1, nthreads); del delta_k1
+            Ix_k1     = IFFT3Dr_f(I_k1, nthreads); del I_k1
 
             # Calculate sum and normalization
             signal, Ntriangles = 0.0, 0.0     
             for i in prange(ng, nogil=True, num_threads=nthreads):
                 for j in range(ng):
                     for k in range(ng):
-                        signal      += (deltar_k1[i,j,k]*deltar_k2[i,j,k]*deltar_k3[i,j,k])
-                        Ntriangles  += (Ir_k1[i,j,k]*Ir_k2[i,j,k]*Ir_k3[i,j,k])
+                        signal      += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])
+                        Ntriangles  += (Ix_k1[i,j,k]*Ix_k2[i,j,k]*Ix_k3[i,j,k])
             
             q_cen_arr[q_ind] = k1*kf
             Bq_arr[q_ind]    = signal/Ntriangles*pow(box_len, 6)/pow(ng, 9)
@@ -935,11 +1177,11 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
         # k_min<k2<k_max
         delta_k2, _ = pick_field(delta_k, k_min, k_max, nthreads)
-        deltar_k2 = IFFT3Dr_f(delta_k2, nthreads); del delta_k2
+        deltax_k2 = IFFT3Dr_f(delta_k2, nthreads); del delta_k2
 
         # 0<k3<inf
         delta_k3, _ = pick_field(delta_k, k3_min, k3_max, nthreads)
-        deltar_k3 = IFFT3Dr_f(delta_k3, nthreads); del delta_k3
+        deltax_k3 = IFFT3Dr_f(delta_k3, nthreads); del delta_k3
 
         # Loop over soft modes
         for q_ind in (range(Nq)):
@@ -948,14 +1190,14 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
             delta_k1, _, k1 = pick_field(delta_k, q_min_arr[q_ind], 
                                             q_min_arr[q_ind]+dq, nthreads,
                                             return_k_bin=True)
-            deltar_k1 = IFFT3Dr_f(delta_k1, nthreads); del delta_k1
+            deltax_k1 = IFFT3Dr_f(delta_k1, nthreads); del delta_k1
 
             # Calculate sum and normalization
             signal = 0.0     
             for i in prange(ng, nogil=True, num_threads=nthreads):
                 for j in range(ng):
                     for k in range(ng):
-                        signal      += (deltar_k1[i,j,k]*deltar_k2[i,j,k]*deltar_k3[i,j,k])
+                        signal      += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])
             
             q_cen_arr[q_ind] = k1*kf
             Bq_arr[q_ind]    = signal*pow(box_len, 6)/pow(ng, 9)
@@ -1045,7 +1287,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
     cdef np.complex64_t[:,:,::1] Fk_2perm, Fk_4perm, Wk_12, Wk_34, Dk_12, Dk_34
     cdef np.ndarray[np.float32_t, ndim=1] k_cen_uniq     
     cdef np.ndarray[np.complex64_t, ndim=4] Wk_uniq, deltak_uniq
-    cdef np.ndarray[np.float32_t, ndim=4] Wr_uniq, deltar_uniq
+    cdef np.ndarray[np.float32_t, ndim=4] Wr_uniq, deltax_uniq
     cdef np.ndarray[np.complex64_t, ndim=5] Wk_filt_pairs_uniq, deltak_filt_pairs_uniq
     cdef np.ndarray[np.float32_t, ndim=5] Fpr_filt_pairs_uniq, Fdr_filt_pairs_uniq
     cdef np.float32_t[:,:,::1] deltak_sq
@@ -1153,7 +1395,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
         k_cen_arr   = np.zeros((Nbin_tot, 5), dtype=np.float32)
         deltak_uniq = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
         Wk_uniq     = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
-        deltar_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
+        deltax_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
         Wr_uniq     = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
         
         # Define Fourier and real space fields
@@ -1162,7 +1404,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
             Wk_uniq[i]     = np.asarray(Wk_i)
             Wr_uniq[i]     = IFFT3Dr_f(Wk_uniq[i], nthreads)
             deltak_uniq[i] = np.asarray(deltak_i)
-            deltar_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
+            deltax_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
         
         # Compute products of windows 
         if verbose:
@@ -1192,7 +1434,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
         for i in range(N_uniq):
             for j in range(i, N_uniq):
                 Wk_filt_pairs_uniq[i,j] = FFT3Dr_f(Wr_uniq[i]*Wr_uniq[j], nthreads)
-                deltak_filt_pairs_uniq[i,j] = FFT3Dr_f(deltar_uniq[i]*deltar_uniq[j], nthreads)
+                deltak_filt_pairs_uniq[i,j] = FFT3Dr_f(deltax_uniq[i]*deltax_uniq[j], nthreads)
                 Fpr_filt_pairs_uniq[i,j] = IFFT3Dr_f(np.asarray(Wk_uniq[i])*
                                                     np.asarray(Wk_uniq[j])*
                                                     Pk_mesh, nthreads)
@@ -1200,7 +1442,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                                                     np.asarray(Wk_uniq[j])*
                                                     deltak_sq, nthreads)
         
-        del deltak_sq, deltar_uniq, Wr_uniq, Pk_mesh 
+        del deltak_sq, deltax_uniq, Wr_uniq, Pk_mesh 
                 
         # Compute trispectrum for every bin
         if verbose:
@@ -1318,14 +1560,14 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
         k_cen_arr   = np.zeros((Nbin_tot, 5), dtype=np.float32)
         deltak_uniq = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
         Wk_uniq     = np.zeros((N_uniq, ng, ng, ng//2+1), dtype=np.complex64)
-        deltar_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
+        deltax_uniq = np.zeros((N_uniq, ng, ng, ng), dtype=np.float32)
 
         # Define Fourier and real space fields
         for i in (range(N_uniq)):
             deltak_i, Wk_i, k_cen_uniq[i] = pick_field(delta_k, *k_bounds_uniq[i], nthreads, return_k_bin=True) 
             Wk_uniq[i]     = np.asarray(Wk_i)
             deltak_uniq[i] = np.asarray(deltak_i)
-            deltar_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
+            deltax_uniq[i] = IFFT3Dr_f(deltak_uniq[i], nthreads)
         
         # Compute products of windows 
         if verbose:
@@ -1354,7 +1596,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
 
         for i in range(N_uniq):
             for j in range(i, N_uniq):
-                deltak_filt_pairs_uniq[i,j] = FFT3Dr_f(deltar_uniq[i]*deltar_uniq[j], nthreads)
+                deltak_filt_pairs_uniq[i,j] = FFT3Dr_f(deltax_uniq[i]*deltax_uniq[j], nthreads)
                 Fpr_filt_pairs_uniq[i,j] = IFFT3Dr_f(np.asarray(Wk_uniq[i])*
                                                     np.asarray(Wk_uniq[j])*
                                                     Pk_mesh, nthreads)
@@ -1362,7 +1604,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                                                     np.asarray(Wk_uniq[j])*
                                                     deltak_sq, nthreads)
         
-        del deltak_sq, deltar_uniq, Pk_mesh 
+        del deltak_sq, deltax_uniq, Pk_mesh 
                 
         # Compute trispectrum for every bin
         if verbose:
@@ -1618,16 +1860,16 @@ def compute_tk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max
         Wk_1 = np.asarray(Wk_1)
         Wk_3 = np.asarray(Wk_3)
 
-        deltar_k1 = IFFT3Dr_f(deltak_1, nthreads)
-        deltar_k3 = IFFT3Dr_f(deltak_3, nthreads)
+        deltax_k1 = IFFT3Dr_f(deltak_1, nthreads)
+        deltax_k3 = IFFT3Dr_f(deltak_3, nthreads)
         deltar    = IFFT3Dr_f(delta_k, nthreads)
 
         Wk_12 = FFT3Dr_f(Wr_1*Wr, nthreads)
         Wk_34 = FFT3Dr_f(Wr_3*Wr, nthreads)
-        Dk_12 = FFT3Dr_f(deltar_k1*deltar, nthreads)
-        Dk_34 = FFT3Dr_f(deltar_k3*deltar, nthreads)
+        Dk_12 = FFT3Dr_f(deltax_k1*deltar, nthreads)
+        Dk_34 = FFT3Dr_f(deltax_k3*deltar, nthreads)
 
-        del Wr_1, Wr_3, Wr, deltar_k1, deltar_k3, deltar
+        del Wr_1, Wr_3, Wr, deltax_k1, deltax_k3, deltar
 
         # Realization independent disconnected term. Note that Wk_2=Wk_4=I
         Fpr_13 = IFFT3Dr_f(Wk_1*Wk_3, nthreads)
@@ -1839,7 +2081,7 @@ def compute_Itk3d_py(delta_k, k1_min, k1_max, k2_min, k2_max, k3_min,
         deltak_uniq[i], Wk_uniq[i], k_cen_uniq[i] = pick_field(delta_k, *k_bounds_uniq[i], nthreads, return_k_bin=True) 
 
     Wr_uniq     = [IFFT3Dr_f(np.asarray(Wk_uniq[i])+0.0j, nthreads) for i in range(N_uniq)]
-    deltar_uniq = [IFFT3Dr_f(np.asarray(deltak_uniq[i])+0.0j, nthreads) for i in range(N_uniq)]
+    deltax_uniq = [IFFT3Dr_f(np.asarray(deltak_uniq[i])+0.0j, nthreads) for i in range(N_uniq)]
 
     # Comptue trispectrum looping over bins
     k_cen_arr      = np.zeros((Nbin_tot, 4), dtype=float)
@@ -1862,18 +2104,18 @@ def compute_Itk3d_py(delta_k, k1_min, k1_max, k2_min, k2_max, k3_min,
                         k_cen_uniq[k3_ind], k_cen_uniq[k4_ind]]
 
         # Compute total and normalization: connected+disconnected
-        Tk_tot_arr[i] = np.sum(deltar_uniq[k1_ind]*deltar_uniq[k2_ind]*
-                               deltar_uniq[k3_ind]*deltar_uniq[k4_ind])
+        Tk_tot_arr[i] = np.sum(deltax_uniq[k1_ind]*deltax_uniq[k2_ind]*
+                               deltax_uniq[k3_ind]*deltax_uniq[k4_ind])
         Ntet_arr[i] = np.sum(Wr_uniq[k1_ind]*Wr_uniq[k2_ind]*
                              Wr_uniq[k3_ind]*Wr_uniq[k4_ind])
 
         # Compute disconnected (delta^2)^2 term
-        Tk_disc_DD_arr[i] = ((np.sum(deltar_uniq[k1_ind]*deltar_uniq[k2_ind])*
-                              np.sum(deltar_uniq[k3_ind]*deltar_uniq[k4_ind]))+
-                             (np.sum(deltar_uniq[k1_ind]*deltar_uniq[k3_ind])*
-                              np.sum(deltar_uniq[k2_ind]*deltar_uniq[k4_ind]))+
-                             (np.sum(deltar_uniq[k1_ind]*deltar_uniq[k4_ind])*
-                              np.sum(deltar_uniq[k2_ind]*deltar_uniq[k3_ind])))
+        Tk_disc_DD_arr[i] = ((np.sum(deltax_uniq[k1_ind]*deltax_uniq[k2_ind])*
+                              np.sum(deltax_uniq[k3_ind]*deltax_uniq[k4_ind]))+
+                             (np.sum(deltax_uniq[k1_ind]*deltax_uniq[k3_ind])*
+                              np.sum(deltax_uniq[k2_ind]*deltax_uniq[k4_ind]))+
+                             (np.sum(deltax_uniq[k1_ind]*deltax_uniq[k4_ind])*
+                              np.sum(deltax_uniq[k2_ind]*deltax_uniq[k3_ind])))
 
         # Compute disconnected P*delta^2 term and normalization
         Wk1 = np.asarray(Wk_uniq[k1_ind])
