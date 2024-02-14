@@ -29,7 +29,7 @@ def test_sum(int N, int num_threads):
 
     tot = 0
     start = time.time()
-    for i in prange(N, nogil=True, num_threads=num_threads):
+    for i in prange(N, nogil=True, num_threads=1):
         tot += i
     end = time.time()
     print(end-start)
@@ -153,7 +153,7 @@ def get_RFFT_mask(int ng, int nthreads):
     RFFT_mask     = np.zeros((ng, ng, middle+1), dtype=np.uint8)
 
     # Loop over field and pick values in [k_min, k_max)
-    for i in prange(ng,  nogil=True, num_threads=nthreads):
+    for i in prange(ng,  nogil=True, num_threads=1):
         ki = (i-ng if (i>middle) else i)
         for j in range(ng):
             kj = (j-ng if (j>middle) else j)
@@ -233,7 +233,7 @@ def initialize_delta(np.ndarray[np.float32_t,ndim=3] delta, MAS, int nthreads):
 #    window = np.ones(ng)
 
     # Apply to input array
-    for i in prange(ng, nogil=True, num_threads=nthreads):
+    for i in prange(ng, nogil=True, num_threads=1):
         wx = window[i]
         for j in range(ng):
             wy = window[j]
@@ -288,7 +288,7 @@ def pick_field(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
         done. 
     """
 
-    cdef float knorm, k_bin, tot
+    cdef double knorm, k_bin, tot
     cdef int ng, i, j, k, ki, kj, kk, middle
     cdef np.complex64_t[:,:,::1] delta_picked, I_picked
 
@@ -301,7 +301,7 @@ def pick_field(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
     I_picked     = np.zeros((ng, ng, middle+1), dtype=np.complex64)
 
     # Loop over field and pick values in [k_min, k_max)
-    for i in prange(ng,  nogil=True, num_threads=nthreads):
+    for i in prange(ng,  nogil=True, num_threads=1):
         ki = (i-ng if (i>middle) else i)
         if(ki>k_max): continue
         
@@ -318,7 +318,6 @@ def pick_field(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 
                 delta_picked[i,j,k] = delta_k[i,j,k]*pow(knorm, alpha)
                 I_picked[i,j,k]     = 1
-
 
                 # kz=0 and kz=middle planes should not be included in any
                 # sums computed over real FFTs
@@ -499,7 +498,7 @@ def compute_Pk3D_single(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
     # Calculate sum and normalization
     signal, pairs = 0.0, 0.0
 
-    for i in prange(ng, nogil=True, num_threads=nthreads):
+    for i in prange(ng, nogil=True, num_threads=1):
         for j in range(ng):
             for k in range(ng):
                 signal += (delta1[i,j,k]*delta1[i,j,k])
@@ -580,7 +579,7 @@ def compute_xPk3D_single(np.complex64_t[:,:,::1] delta_ka,
     # Calculate sum and normalization
     signal, pairs = 0.0, 0.0
 
-    for i in prange(ng, nogil=True, num_threads=nthreads):
+    for i in prange(ng, nogil=True, num_threads=1):
         for j in range(ng):
             for k in range(ng):
                 signal += (delta_xa_k1[i,j,k]*delta_xb_k1[i,j,k])
@@ -667,7 +666,7 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
         print("-> {} bins".format(Nk))
 
     # Loop over momentum bins
-    for i in prange(ng,nogil=True, num_threads=nthreads):
+    for i in prange(ng,nogil=True, num_threads=1):
         ki = (i-ng if (i>middle) else i)
         
         for j in range(ng):
@@ -780,7 +779,7 @@ def compute_xPk3D_binned(np.complex64_t[:,:,::1] delta_k_a,
         print("-> {} bins".format(Nk))
 
     # Loop over momentum bins
-    for i in prange(ng,nogil=True, num_threads=nthreads):
+    for i in prange(ng,nogil=True, num_threads=1):
         ki = (i-ng if (i>middle) else i)
         
         for j in range(ng):
@@ -984,7 +983,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
             signal, Ntri = 0.0, 0.0
             
             # Can parallelize this with some work
-            for i in prange(ng,nogil=True, num_threads=nthreads):
+            for i in prange(ng,nogil=True, num_threads=1):
                 for j in range(ng):
                     for k in range(ng):
 
@@ -1049,7 +1048,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
             # Compute sum in real space
             signal = 0.0
             
-            for i in prange(ng,nogil=True, num_threads=nthreads): 
+            for i in prange(ng,nogil=True, num_threads=1): 
                 for j in range(ng):
                     for k in range(ng):
                         signal += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])         
@@ -1111,7 +1110,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
     # Initialize variables
     cdef int Nq, ng, q_ind, i, j, k
-    cdef float  kf, signal, Ntriangles
+    cdef double  kf, signal, Ntriangles
     cdef np.ndarray[np.int64_t, ndim=1] q_min_arr      
     cdef np.ndarray[np.float32_t, ndim=1] q_cen_arr, Bq_arr#, Bqnorm_arr
 
@@ -1155,7 +1154,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
             # Calculate sum and normalization
             signal, Ntriangles = 0.0, 0.0     
-            for i in prange(ng, nogil=True, num_threads=nthreads):
+            for i in prange(ng, nogil=True, num_threads=1):
                 for j in range(ng):
                     for k in range(ng):
                         signal      += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])
@@ -1163,7 +1162,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
             
             q_cen_arr[q_ind] = k1*kf
             Bq_arr[q_ind]    = signal/Ntriangles*pow(box_len, 6)/pow(ng, 9)
-            Bqnorm_arr[q_ind]  = Ntriangles/pow(ng, 3)
+            Bqnorm_arr[q_ind]  = Ntriangles#/pow(ng, 3)
 
         return q_cen_arr, Bq_arr, Bqnorm_arr
     
@@ -1194,7 +1193,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
             # Calculate sum and normalization
             signal = 0.0     
-            for i in prange(ng, nogil=True, num_threads=nthreads):
+            for i in prange(ng, nogil=True, num_threads=1):
                 for j in range(ng):
                     for k in range(ng):
                         signal      += (deltax_k1[i,j,k]*deltax_k2[i,j,k]*deltax_k3[i,j,k])
@@ -1426,7 +1425,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                                     dtype=np.float32)
         deltak_sq = np.zeros((ng,ng,ng//2+1), dtype=np.float32)
 
-        for i in prange(ng, nogil=True, num_threads=nthreads):
+        for i in prange(ng, nogil=True, num_threads=1):
             for j in range(ng):
                 for k in range(ng//2+1):
                     deltak_sq[i,j,k] = pow(delta_k[i,j,k].real,2)+pow(delta_k[i,j,k].imag, 2)
@@ -1505,7 +1504,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
 
             # Compute Fourier space sum.
             Tk_tot = 0.0; Ntet_tot = 0.0; Tk_disc_PP_tot = 0.0; Tk_disc_PD_tot = 0.0
-            for i in range(ng): #prange(ng, nogil=True, num_threads=nthreads):
+            for i in range(ng):
                 ki = (i-ng if (i>middle) else i)
                 if(ki>k12_max_i): continue
                 
@@ -1589,7 +1588,7 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                                     dtype=np.float32)
         deltak_sq = np.zeros((ng,ng,ng//2+1), dtype=np.float32)
 
-        for i in prange(ng, nogil=True, num_threads=nthreads):
+        for i in prange(ng, nogil=True, num_threads=1):
             for j in range(ng):
                 for k in range(ng//2+1):
                     deltak_sq[i,j,k] = pow(delta_k[i,j,k].real,2)+pow(delta_k[i,j,k].imag, 2)
@@ -1846,7 +1845,7 @@ def compute_tk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max
 
         deltak_sq = np.zeros((ng,ng,ng//2+1), dtype=np.float32)
 
-        for i in prange(ng, nogil=True, num_threads=nthreads):
+        for i in prange(ng, nogil=True, num_threads=1):
             for j in range(ng):
                 for k in range(ng//2+1):
                     deltak_sq[i,j,k] = pow(delta_k[i,j,k].real,2)+pow(delta_k[i,j,k].imag, 2)
