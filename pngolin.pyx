@@ -1070,7 +1070,7 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
 @cython.wraparound(False)
 def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
                          int dq, int k_min, int k_max, double box_len, 
-                         int nthreads, int k3_min=0, int k3_max=500,
+                         int nthreads, int k3_min=0, int k3_max=1000000,
                          np.ndarray[np.float32_t, ndim=1] Bqnorm_arr=None):
     """
     Computes angular averaged bispectrum estimator used in 2209.06228. This is
