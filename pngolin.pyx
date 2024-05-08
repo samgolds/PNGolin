@@ -209,14 +209,16 @@ def initialize_delta(np.ndarray[np.float32_t,ndim=3] delta, MAS, int nthreads):
     cdef np.ndarray[np.float64_t, ndim=1] ind_1d, window
 
     # Get appropriate power for window correction based on assignment scheme
-    assert MAS in ['NGP', 'CIC', 'TSC'], "MAS must be in ['NGP', 'CIC', 'TSC']"
+    assert MAS in ['NGP', 'CIC', 'TSC', None], "MAS must be in ['NGP', 'CIC', 'TSC']"
 
     if MAS=='NGP':
         power = 1
     elif MAS=='CIC':
         power = 2
-    else:
+    elif MAS=='TSC':
         power = 3
+    else:
+        power = 0 
 
     # Get grid size properties
     ng =  delta.shape[0]
@@ -601,7 +603,7 @@ def compute_xPk3D_single(np.complex64_t[:,:,::1] delta_ka,
 @cython.wraparound(False)
 def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
                         int dk, double box_len, int nthreads, double alpha=0,
-                        verbose=False):
+                        transfer_interp=None, verbose=False):
     """
     Computes 3D auto power power spectrum of a density field in bins between
     k_min and k_max with spacing dk. k_min, k_max, and dk are all in units of
@@ -621,8 +623,15 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
     nthreads: integer
         Number of threads for the outer loop over grid indices and for FFTs.
     alpha: float (optional; default 0)
-        Optional float that allows for momentum weighted power spectra. Used 
-        in squeezed bispectrum modelling.
+        Optional float that allows for momentum weighted power spectra. A non-zero
+        value of alpha will compute <k^alpha delta_k delta_-k>. This is useful
+        for avoiding discreteness effects from the small number of modes at low 
+        k.
+    transfer_interp: interpolator (optional; default False)
+        Interpolator that inverse weights the power spectrum by the transfer 
+        function. These expressions typically appear in PNG models where we 
+        need <delta_k delta_-k/T(k)>. This is useful for avoiding discreteness 
+        effects from the small number of modes at low k.
     verbose: bool (optional; default False)
         Sets verbosity
 
@@ -666,7 +675,7 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
         print("-> {} bins".format(Nk))
 
     # Loop over momentum bins
-    for i in prange(ng,nogil=True, num_threads=1):
+    for i in range(ng):
         ki = (i-ng if (i>middle) else i)
         
         for j in range(ng):
@@ -684,12 +693,21 @@ def compute_Pk3D_binned(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 
                 # Get index
                 k_ind = lround((knorm-k_min)/dk-0.499999)
+                
+                # Divide by transfer function interpolator (if requested)
+                if transfer_interp is None:
+                    if 0<=k_ind<Nk:
+                        k_arr[k_ind] += knorm
+                        Pk_arr[k_ind] += (pow(delta_k[i,j,k].real, 2)+
+                                        pow(delta_k[i,j,k].imag, 2))*pow(knorm, alpha)
+                        Nmodes_arr[k_ind] += 1
+                else:
+                    if 0<=k_ind<Nk:
+                        k_arr[k_ind] += knorm
+                        Pk_arr[k_ind] += (pow(delta_k[i,j,k].real, 2)+
+                                          pow(delta_k[i,j,k].imag, 2))*(pow(knorm, alpha)/transfer_interp(knorm*kf))
+                        Nmodes_arr[k_ind] += 1
 
-                if 0<=k_ind<Nk:
-                    k_arr[k_ind] += knorm
-                    Pk_arr[k_ind] += (pow(delta_k[i,j,k].real, 2)+
-                                      pow(delta_k[i,j,k].imag, 2))*pow(knorm, alpha)
-                    Nmodes_arr[k_ind] += 1
 
     k_arr  = kf*k_arr/Nmodes_arr
     Pk_arr = (Pk_arr/Nmodes_arr)*(box_len/ng**2)**3
@@ -1871,7 +1889,7 @@ def compute_tk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max
         del Wr_1, Wr_3, Wr, deltax_k1, deltax_k3, deltar
 
         # Realization independent disconnected term. Note that Wk_2=Wk_4=I
-        Fpr_13 = IFFT3Dr_f(Wk_1*Wk_3, nthreads)
+        Fpr_13 = IFFT3Dr_f(Wk_1*Wk_3*Pk_mesh, nthreads) # Added *Pk_mesh here 
         Fpr_24 = IFFT3Dr_f(Wk*Pk_mesh, nthreads) # Multiply by Wk=Ik to type cast
         Fpr_14 = IFFT3Dr_f(Wk_1*Pk_mesh, nthreads)
         Fpr_23 = IFFT3Dr_f(Wk_3*Pk_mesh, nthreads)
@@ -1945,8 +1963,439 @@ def compute_tk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max
         Tk_disc_PD_arr = Tk_disc_PD_arr/Ntet_arr*pow(box_len/ng,6)/(2*pow(ng,3))
 
         return k12_cen_arr, Tk_tot_arr, Tk_disc_PP_arr, Tk_disc_PD_arr, Ntet_arr
+    # Has normalization and realization-inndependent disconnected terms already    
+    else:
+        # Compute all unique windows for the k bounds
+        deltak_1, Wk_1, k1_cen = pick_field(delta_k, k1_min, k1_max, nthreads,
+                                            return_k_bin=True) 
+        deltak_3, Wk_3, k3_cen = pick_field(delta_k, k3_min, k3_max, nthreads,
+                                            return_k_bin=True)
+        Wk = np.ones_like(Wk_1)
+
+        deltak_sq = np.zeros((ng,ng,ng//2+1), dtype=np.float32)
+
+        for i in prange(ng, nogil=True, num_threads=1):
+            for j in range(ng):
+                for k in range(ng//2+1):
+                    deltak_sq[i,j,k] = pow(delta_k[i,j,k].real,2)+pow(delta_k[i,j,k].imag, 2)
+
+        # Compute real space fields
+        Wr_1 = IFFT3Dr_f(Wk_1, nthreads)
+        Wr_3 = IFFT3Dr_f(Wk_3, nthreads)
+        Wr   = IFFT3Dr_f(Wk, nthreads)
+
+        Wk = np.asarray(Wk)
+        Wk_1 = np.asarray(Wk_1)
+        Wk_3 = np.asarray(Wk_3)
+
+        deltax_k1 = IFFT3Dr_f(deltak_1, nthreads)
+        deltax_k3 = IFFT3Dr_f(deltak_3, nthreads)
+        deltar    = IFFT3Dr_f(delta_k, nthreads)
+
+        Wk_12 = FFT3Dr_f(Wr_1*Wr, nthreads)
+        Wk_34 = FFT3Dr_f(Wr_3*Wr, nthreads)
+        Dk_12 = FFT3Dr_f(deltax_k1*deltar, nthreads)
+        Dk_34 = FFT3Dr_f(deltax_k3*deltar, nthreads)
+
+        del Wr_1, Wr_3, Wr, deltax_k1, deltax_k3, deltar
+
+        # Realization independent disconnected term. Note that Wk_2=Wk_4=I
+        Fpr_13 = IFFT3Dr_f(Wk_1*Wk_3*Pk_mesh, nthreads)
+        Fpr_24 = IFFT3Dr_f(Wk*Pk_mesh, nthreads) # Multiply by Wk=Ik to type cast
+        Fpr_14 = IFFT3Dr_f(Wk_1*Pk_mesh, nthreads)
+        Fpr_23 = IFFT3Dr_f(Wk_3*Pk_mesh, nthreads)
+    
+
+        del Pk_mesh,
+
+        # Realization dependent disconnected term. Note that Wk_2=Wk_4=I
+        Fdr_13   = IFFT3Dr_f(Wk_1*Wk_3*deltak_sq, nthreads)
+        Fdr_24   = IFFT3Dr_f(Wk*deltak_sq, nthreads)
+        Fdr_14   = IFFT3Dr_f(Wk_1*deltak_sq, nthreads)
+        Fdr_23   = IFFT3Dr_f(Wk_3*deltak_sq, nthreads)
+        Fk_4perm = FFT3Dr_f(Fpr_13*Fdr_24+Fdr_13*Fpr_24+
+                            Fpr_14*Fdr_23+Fdr_14*Fpr_23, nthreads)
+
+        del deltak_sq, Fdr_13, Fdr_24, Fdr_14, Fdr_23, Wk_1, Wk_3
+
+        # Realization dependent terms
+        Tk_tot_arr = np.zeros(Nbin_tot, dtype=np.float32)
+        Tk_disc_PD_arr = np.zeros_like(Tk_tot_arr)
 
 
+        for ik, k12_min_i in enumerate(k12_min_arr): 
+            k12_max_i = k12_min_i+dk12
+
+            # Compute Fourier space sum.
+            Tk_tot = 0.0; Ntet_tot = 0.0; Tk_disc_PP_tot = 0.0; Tk_disc_PD_tot = 0.0
+            k12tot = 0.0; Ntot=0.0
+            for i in range(ng): 
+                ki = (i-ng if (i>middle) else i)
+                if(ki>k12_max_i): continue
+                
+                for j in range(ng):
+                    kj = (j-ng if (j>middle) else j)
+                    
+                    if(kj>k12_max_i): continue
+                    for k in range(middle+1): 
+                            kk = (k-ng if (k>middle) else k)
+                            if(kk>k12_max_i): continue
+
+                            # kz=0 and kz=middle planes should only be counted once
+                            if kk==0 or (kk==middle and ng%2==0):
+                                if ki<0: continue
+                                elif ki==0 or (ki==middle and ng%2==0):
+                                    if kj<0.0: continue
+                            
+                            # Select k bin
+                            k12norm = sqrt(ki*ki+kj*kj+kk*kk)
+                            if(k12norm<k12_min_i or k12norm>=k12_max_i): continue
+
+                            Tk_tot   += np.real(Dk_12[i,j,k]*np.conj(Dk_34[i,j,k]))
+                            Tk_disc_PD_tot += np.real(Fk_4perm[i,j,k])
+
+                            k12tot += k12norm
+                            Ntot   += 1      
+
+            k12_cen_arr[ik]    = kf*k12tot/Ntot
+            Tk_tot_arr[ik]     = Tk_tot
+            Tk_disc_PD_arr[ik] = Tk_disc_PD_tot
+        
+        # Normalize output
+        Tk_tot_arr     = Tk_tot_arr/Ntet_arr*pow(box_len/ng, 9)/pow(ng, 3)
+        Tk_disc_PD_arr = Tk_disc_PD_arr/Ntet_arr*pow(box_len/ng,6)/(2*pow(ng,3))
+
+        return k12_cen_arr, Tk_tot_arr, Tk_disc_PP_arr, Tk_disc_PD_arr, Ntet_arr
+
+
+
+"""
+Trispectrum estimator binned in k12 and averaged over k1min<k1,k2<k1max
+and k3min<k3, k4<k3max. Notice that this difers from compute_tk3d_ang_avg 
+because it explicitly bins k2 and k4.
+"""
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
+def compute_tk3d_sym_ang_avg(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max, 
+                         int k3_min, int k3_max,  int k12_min, int k12_max,
+                         int dk12, double box_len, int nthreads, verbose=False, 
+                         Pk_interp=None, np.float32_t[:,:,::1] Pk_mesh=None,
+                         np.ndarray[np.float32_t, ndim=1] Tk_disc_PP_arr=None,
+                         np.ndarray[np.float32_t, ndim=1] Ntet_arr=None):
+    """
+    Cython implementation of the binned trispectrum estimator. For an input of 
+    minimum and maximum wavenumbers as well as bin spacing, the code computes
+    the trispectrum in all possible bins subject to:
+    * k1 ≤ k2
+    * k2 ≤ k3, (Will's paper uses k1≤k3)
+    * k3 ≤ k4,
+    * |k1-k2| ≤ k1+k2,
+    * |k3-k4| ≤ k3+k4.
+    N.B. the inequalities are checked at the bin minima, but probably should be
+    imposed at the bin centers.
+    UPDATE
+
+    Parameters 
+    ----------
+    delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
+        Fourier space density field.
+    ki_min: int
+        Minimum wave number for the ith leg in units of kf=2pi/box_len.
+    ki_max: int 
+        Maximum wave number for the ith leg in units of kf=2pi/box_len.
+    dki: int
+        Bin spacing for the ith leg in units of kf.
+    box_len: float 
+        Length of the box (typically in units of Mpc/h or Mpc). This sets the 
+        dimensions of the power spectrum as well as the fundamental frequency.
+    nthreads: integer
+        Number of threads for the outer loop over grid indices and for FFTs.
+    verbose: bool
+        Verbosity. Set to true to print progress.
+    Pk_interp: function (optional; default=None)
+        Function that computes the expected 3D power spectrum of the field.
+        This is used to compute the disconnected term in the estimator. This
+        must be passed if Pk_mesh is not passed. Function f(x) units should be
+        [x]=1/box_len and [f(x)]=box_len^3
+    Pk_mesh: (Ngrid, Ngrid, Ngrid//2+1) float array (optional; default=None)
+        Array containing the value of the fiducial power spectrum at each kbin
+        in Fourier space. This is used to compute the disconnected term of the 
+        estimator and is much faster to use than Pk_interp.
+    Tk_disc_PP_arr: float array (optional; default=None)
+        Array containing the realization-independent contribution to the 
+        disconnected estimator. Since this only needs to be computed once,
+        it should be passed as input to significantly speed up the code. This 
+        is also used to identify the bins where disconnected terms need to be
+        computed.
+    N_tet_arr: float array (optional; defaut=None)
+        Array containing the normalization for the trispectrum. This also needs
+        to only be computed once so passing it in as input signifcantly speeds
+        up the code.
+
+    Returns
+    ----------
+    """
+
+    cdef int ng, middle, Nk12, i1, i2, i12, i3, i4, i, j, k, ik
+    cdef int k12_min_i, k12_max_i, ki, kj, kk, 
+    cdef double kf, start, end,  k12norm, k12tot, N12
+    cdef np.ndarray[np.int16_t, ndim=1] k12_min_arr
+    cdef np.ndarray[np.float32_t, ndim=1] Tk_tot_arr, Tk_disc_PD_arr
+    cdef double Tk_tot, Ntet_tot, Tk_disc_PP_tot, Tk_disc_PD_tot
+    cdef np.complex64_t[:,:,::1] Fk_2perm, Fk_4perm, Wk_12, Wk_34, Dk_12, Dk_34
+    cdef np.ndarray[np.float32_t, ndim=1] k_cen_uniq     
+    cdef np.float32_t[:,:,::1] deltak_sq
+
+    # Compute some constants and useful variables
+    ng     = delta_k.shape[0]
+    middle = ng//2
+    kf     = 2*pi/box_len
+
+    # Initializaiton
+    if verbose:
+        print("0. INITIALIAZING TRISPECTRUM CALCULATION")
+        start = time.time()
+
+    if Pk_mesh is None:
+        assert Pk_interp is not None, "Pk_interp or Pk_mesh must be specified"
+        if verbose: 
+            print("-> No Pk_mesh inputed. Computing from interpolator.")
+        Pk_mesh = construct_Pk_mesh(ng, Pk_interp, box_len, nthreads)
+    
+    if Ntet_arr is None:
+        assert Tk_disc_PP_arr is None, "If Ntet_arr is None, then T_disk_PP_arr must also be None"
+        need_norm=True
+        if verbose: print("-> No normalization specified. Routine will compute normalization and realization independent disconnected term.")
+    else:
+        assert Tk_disc_PP_arr is not None, "If Ntet_arr is not None, then T_disk_PP_arr must also be None"
+        assert len(Tk_disc_PP_arr)==len(Ntet_arr), "Ntet_arr and T_disk_PP_arr must be the same length."
+        need_norm = False
+        if verbose: print("-> Normalization specified and realization independent disconnected term inputted. Only computing realization dependent terms.")
+
+    if verbose:
+        end = time.time()
+        print("-> Time taken: {:.3f} seconds".format(end-start))
+
+    # Bin initialization
+    if verbose: 
+        start = time.time()
+        print("1. INITIALIZING BINS")
+        
+    k12_min_arr = np.arange(k12_min, k12_max, dk12, dtype=np.int16) 
+    Nk12 = len(k12_min_arr)     
+    k12_cen_arr = np.zeros(Nk12, dtype=np.float32)   
+
+    Nbin_tot = Nk12
+
+    # No normalization or disconnected term specified. Compute everything!    
+    if need_norm:
+        # Compute all unique windows for the k bounds
+        deltak_1, Wk_1, k1_cen = pick_field(delta_k, k1_min, k1_max, nthreads,
+                                            return_k_bin=True) 
+        deltak_3, Wk_3, k3_cen = pick_field(delta_k, k3_min, k3_max, nthreads,
+                                            return_k_bin=True)
+        Wk = np.ones_like(Wk_1)
+
+        deltak_sq = np.zeros((ng,ng,ng//2+1), dtype=np.float32)
+
+        for i in prange(ng, nogil=True, num_threads=1):
+            for j in range(ng):
+                for k in range(ng//2+1):
+                    deltak_sq[i,j,k] = pow(delta_k[i,j,k].real,2)+pow(delta_k[i,j,k].imag, 2)
+
+        # Compute real space fields
+        Wr_1 = IFFT3Dr_f(Wk_1, nthreads)
+        Wr_3 = IFFT3Dr_f(Wk_3, nthreads)
+
+
+        Wk = np.asarray(Wk)
+        Wk_1 = np.asarray(Wk_1)
+        Wk_3 = np.asarray(Wk_3)
+
+        deltax_k1 = IFFT3Dr_f(deltak_1, nthreads)
+        deltax_k3 = IFFT3Dr_f(deltak_3, nthreads)
+
+        Wk_12 = FFT3Dr_f(Wr_1*Wr_1, nthreads)
+        Wk_34 = FFT3Dr_f(Wr_3*Wr_3, nthreads)
+        Dk_12 = FFT3Dr_f(deltax_k1*deltax_k1, nthreads)
+        Dk_34 = FFT3Dr_f(deltax_k3*deltax_k3, nthreads)
+
+        del Wr_1, Wr_3, deltax_k1, deltax_k3,
+
+        # Realization independent disconnected term. Note that Wk_2=Wk_1 and Wk_4=Wk_3
+        Fpr_13 = IFFT3Dr_f(Wk_1*Wk_3*Pk_mesh, nthreads) # Added *Pk_mesh here 
+        # Fpr_24 = Fpr_13  # Wk2*Wk4=Wk1*Wk3. All permutations are identical for symmetric estimator
+        # Fpr_14 = Fpr_13 
+        # Fpr_23 = Fpr_13
+        Fk_2perm = FFT3Dr_f(2*Fpr_13*Fpr_13, nthreads)
+
+        del Pk_mesh,
+
+        # Realization dependent disconnected term. Note that Wk_2=Wk_1 and Wk_4=Wk_3
+        Fdr_13   = IFFT3Dr_f(Wk_1*Wk_3*deltak_sq, nthreads)
+        # Fdr_24   = Fdr_13
+        # Fdr_14   = Fdr_13
+        # Fdr_23   = Fdr_13
+        Fk_4perm = FFT3Dr_f(4*Fpr_13*Fdr_13, nthreads)
+
+        del deltak_sq, Wk_1, Wk_3, Fdr_13 #, Fdr_24, Fdr_14, Fdr_23,
+
+        # Realization dependent terms
+        Tk_tot_arr = np.zeros(Nbin_tot, dtype=np.float32)
+        Tk_disc_PD_arr = np.zeros_like(Tk_tot_arr)
+
+        # Realization independent terms (only compute once)
+        Ntet_arr = np.zeros_like(Tk_tot_arr)
+        Tk_disc_PP_arr = np.zeros_like(Tk_tot_arr)
+
+        for ik, k12_min_i in enumerate(k12_min_arr): 
+            k12_max_i = k12_min_i+dk12
+
+            # Compute Fourier space sum.
+            Tk_tot = 0.0; Ntet_tot = 0.0; Tk_disc_PP_tot = 0.0; Tk_disc_PD_tot = 0.0
+            k12tot = 0.0; Ntot=0.0
+            for i in range(ng): 
+                ki = (i-ng if (i>middle) else i)
+                if(ki>k12_max_i): continue
+                
+                for j in range(ng):
+                    kj = (j-ng if (j>middle) else j)
+                    
+                    if(kj>k12_max_i): continue
+                    for k in range(middle+1): 
+                            kk = (k-ng if (k>middle) else k)
+                            if(kk>k12_max_i): continue
+
+                            # kz=0 and kz=middle planes should only be counted once
+                            if kk==0 or (kk==middle and ng%2==0):
+                                if ki<0: continue
+                                elif ki==0 or (ki==middle and ng%2==0):
+                                    if kj<0.0: continue
+                            
+                            # Select k bin
+                            k12norm = sqrt(ki*ki+kj*kj+kk*kk)
+                            if(k12norm<k12_min_i or k12norm>=k12_max_i): continue
+
+                            Tk_tot   += np.real(Dk_12[i,j,k]*np.conj(Dk_34[i,j,k]))
+                            Ntet_tot += np.real(Wk_12[i,j,k]*np.conj(Wk_34[i,j,k]))
+                            Tk_disc_PP_tot += np.real(Fk_2perm[i,j,k])
+                            Tk_disc_PD_tot += np.real(Fk_4perm[i,j,k])
+
+                            k12tot += k12norm
+                            Ntot   += 1      
+
+            k12_cen_arr[ik]    = kf*k12tot/Ntot
+            Tk_tot_arr[ik]     = Tk_tot
+            Ntet_arr[ik]       = Ntet_tot
+            Tk_disc_PP_arr[ik] = Tk_disc_PP_tot
+            Tk_disc_PD_arr[ik] = Tk_disc_PD_tot
+        
+        # Normalize output
+        Tk_tot_arr     = Tk_tot_arr/Ntet_arr*pow(box_len/ng, 9)/pow(ng, 3)
+        Tk_disc_PP_arr = Tk_disc_PP_arr/Ntet_arr*pow(box_len/ng, 3)
+        Tk_disc_PD_arr = Tk_disc_PD_arr/Ntet_arr*pow(box_len/ng,6)/(2*pow(ng,3))
+
+        return k12_cen_arr, Tk_tot_arr, Tk_disc_PP_arr, Tk_disc_PD_arr, Ntet_arr
+    # Has normalization and realization-inndependent disconnected terms already    
+    else:
+        # Compute all unique windows for the k bounds
+        deltak_1, Wk_1, k1_cen = pick_field(delta_k, k1_min, k1_max, nthreads,
+                                            return_k_bin=True) 
+        deltak_3, Wk_3, k3_cen = pick_field(delta_k, k3_min, k3_max, nthreads,
+                                            return_k_bin=True)
+        Wk = np.ones_like(Wk_1)
+
+        deltak_sq = np.zeros((ng,ng,ng//2+1), dtype=np.float32)
+
+        for i in prange(ng, nogil=True, num_threads=1):
+            for j in range(ng):
+                for k in range(ng//2+1):
+                    deltak_sq[i,j,k] = pow(delta_k[i,j,k].real,2)+pow(delta_k[i,j,k].imag, 2)
+
+        # Compute real space fields
+        Wr_1 = IFFT3Dr_f(Wk_1, nthreads)
+        Wr_3 = IFFT3Dr_f(Wk_3, nthreads)
+
+        Wk_1 = np.asarray(Wk_1)
+        Wk_3 = np.asarray(Wk_3)
+
+        deltax_k1 = IFFT3Dr_f(deltak_1, nthreads)
+        deltax_k3 = IFFT3Dr_f(deltak_3, nthreads)
+
+        Wk_12 = FFT3Dr_f(Wr_1*Wr_1, nthreads)
+        Wk_34 = FFT3Dr_f(Wr_3*Wr_3, nthreads)
+        Dk_12 = FFT3Dr_f(deltax_k1*deltax_k1, nthreads)
+        Dk_34 = FFT3Dr_f(deltax_k3*deltax_k3, nthreads)
+
+        del Wr_1, Wr_3, deltax_k1, deltax_k3
+
+        # Realization independent disconnected term. Note that Wk_2=Wk_4=I
+        Fpr_13 = IFFT3Dr_f(Wk_1*Wk_3*Pk_mesh, nthreads)
+        # Fpr_24 = Fpr_13
+        # Fpr_14 = Fpr_13
+        # Fpr_23 = Fpr_13
+    
+
+        del Pk_mesh,
+
+        # Realization dependent disconnected term. Note that Wk_2=Wk_4=I
+        Fdr_13   = IFFT3Dr_f(Wk_1*Wk_3*deltak_sq, nthreads) # All permutations are equal
+        # Fdr_24   = Fdr_13
+        # Fdr_14   = Fdr_13
+        # Fdr_23   = Fdr_13
+        Fk_4perm = FFT3Dr_f(4*Fpr_13*Fdr_13, nthreads)
+
+        del deltak_sq, Wk_1, Wk_3, Fdr_13 #, Fdr_24, Fdr_14, Fdr_23,
+
+        # Realization dependent terms
+        Tk_tot_arr = np.zeros(Nbin_tot, dtype=np.float32)
+        Tk_disc_PD_arr = np.zeros_like(Tk_tot_arr)
+
+
+        for ik, k12_min_i in enumerate(k12_min_arr): 
+            k12_max_i = k12_min_i+dk12
+
+            # Compute Fourier space sum.
+            Tk_tot = 0.0; Ntet_tot = 0.0; Tk_disc_PP_tot = 0.0; Tk_disc_PD_tot = 0.0
+            k12tot = 0.0; Ntot=0.0
+            for i in range(ng): 
+                ki = (i-ng if (i>middle) else i)
+                if(ki>k12_max_i): continue
+                
+                for j in range(ng):
+                    kj = (j-ng if (j>middle) else j)
+                    
+                    if(kj>k12_max_i): continue
+                    for k in range(middle+1): 
+                            kk = (k-ng if (k>middle) else k)
+                            if(kk>k12_max_i): continue
+
+                            # kz=0 and kz=middle planes should only be counted once
+                            if kk==0 or (kk==middle and ng%2==0):
+                                if ki<0: continue
+                                elif ki==0 or (ki==middle and ng%2==0):
+                                    if kj<0.0: continue
+                            
+                            # Select k bin
+                            k12norm = sqrt(ki*ki+kj*kj+kk*kk)
+                            if(k12norm<k12_min_i or k12norm>=k12_max_i): continue
+
+                            Tk_tot   += np.real(Dk_12[i,j,k]*np.conj(Dk_34[i,j,k]))
+                            Tk_disc_PD_tot += np.real(Fk_4perm[i,j,k])
+
+                            k12tot += k12norm
+                            Ntot   += 1      
+
+            k12_cen_arr[ik]    = kf*k12tot/Ntot
+            Tk_tot_arr[ik]     = Tk_tot
+            Tk_disc_PD_arr[ik] = Tk_disc_PD_tot
+        
+        # Normalize output
+        Tk_tot_arr     = Tk_tot_arr/Ntet_arr*pow(box_len/ng, 9)/pow(ng, 3)
+        Tk_disc_PD_arr = Tk_disc_PD_arr/Ntet_arr*pow(box_len/ng,6)/(2*pow(ng,3))
+
+        return k12_cen_arr, Tk_tot_arr, Tk_disc_PP_arr, Tk_disc_PD_arr, Ntet_arr
 
 """
 Integrated trispectrum estimator binned integrated over k12
