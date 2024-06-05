@@ -1,2 +1,2 @@
 # PNGolin
-Fun stuff with PNG.
+Fun stuff with PNG. Update this before releasing paper!
