@@ -13,29 +13,6 @@ cimport cython
 from cython.parallel cimport prange, parallel
 from libc.math cimport sqrt, pow, sin, pi, abs,  lround
 
-
-################################################################################
-# Parallel testing routines
-################################################################################
-@cython.boundscheck(False)
-@cython.cdivision(False)
-@cython.wraparound(False)
-def test_sum(int N, int num_threads):
-    """
-    Simple sum function
-    """
-    
-    cdef int i, tot
-
-    tot = 0
-    start = time.time()
-    for i in prange(N, nogil=True, num_threads=1):
-        tot += i
-    end = time.time()
-    print(end-start)
-    return tot
-
-
 ################################################################################
 # Fourier transform routines
 ################################################################################
@@ -198,8 +175,6 @@ def initialize_delta(np.ndarray[np.float32_t,ndim=3] delta, MAS, int nthreads):
     -------
     delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
         Fourier transformed and window deconvolved density field.
-
-    TO DO: output doesn't need to be complex!
     """
 
     cdef double wx, wy, wz
@@ -341,55 +316,6 @@ def pick_field(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
 @cython.boundscheck(False)
 @cython.cdivision(False)
 @cython.wraparound(False)
-def construct_pi_giri(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max, 
-                      int nthreads):
-    """
-    Constructs pi fields from https://arxiv.org/abs/2305.03070. These fields are
-    meant to encapsulate an auxiliary field weighted by the local small-scale
-    power spectrum. The precise definition of the auxiliary field is:
-        pi(x) = (int d^3k/(2pi)^3 W^i(k)rho(k) e^{ikx})^2
-
-    Parameters
-    ----------
-    delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field.
-    k_min: int
-        Minimum wave number in units of kf.
-    k_max: int 
-        Maximum wave number in units of kf.
-    nthreads: integer
-        Number of threads for the outer loop over grid indices and for FFTs.
-
-    Returns #UPDATE THIS
-    -------
-    delta_picked: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field that includes only modes in [k_min, k_max).
-    """
-
-    cdef int ng, i, j, k
-    cdef np.complex64_t[:,:,::1] delta_picked
-    cdef np.float32_t[:,:,::1] deltax_picked, pix_picked
-
-    # Useful quantitites
-    ng     =  delta_k.shape[0]
-
-    # Get filtered density field W^{i}(k)delta(k)
-    delta_picked = pick_field(delta_k, k_min, k_max, nthreads)[0]
-
-    # Compute IFFT
-    deltax_picked = IFFT3Dr_f(delta_picked, nthreads)
-    pix_picked = np.zeros((ng, ng, ng), dtype=np.float32)
-
-    for i in range(ng):
-        for j in range(ng):
-            for k in range(ng):
-                pix_picked[i,j,k] = pow(deltax_picked[i,j,k], 2)
-
-    return pix_picked
-
-@cython.boundscheck(False)
-@cython.cdivision(False)
-@cython.wraparound(False)
 def construct_Pk_mesh(int ng, Pk_interp, double box_len, int nthreads):
     """
     Function that constructs a mesh of P(k) values on a particular Fourier
@@ -412,7 +338,7 @@ def construct_Pk_mesh(int ng, Pk_interp, double box_len, int nthreads):
     Returns
     -------
     Pk_mesh: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field that has P(k) value at every location on the
+        Fourier space field that has P(k) value at every location on the
         mesh.
     """
 
@@ -441,163 +367,10 @@ def construct_Pk_mesh(int ng, Pk_interp, double box_len, int nthreads):
 
     return Pk_mesh
 
+
 ################################################################################
 # Power spectrum routines
 ################################################################################
-@cython.boundscheck(False)
-@cython.cdivision(False)
-@cython.wraparound(False)
-def compute_Pk3D_single(np.complex64_t[:,:,::1] delta_k, int k_min, int k_max,
-                        double box_len, int nthreads,  double alpha=0):
-    """
-    Computes 3D auto power power spectrum of a density field in a single bin 
-    between [k_min, k_max) where k_min and k_max are in units of kf.
-
-    Parameters
-    ----------
-    delta_k: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field.
-    k_min: int
-        Minimum wave number in units of kf=2pi/box_len.
-    k_max: int 
-        Maximum wave number in units of kf=2pi/box_len.
-    box_len: float 
-        Length of the box (typically in units of Mpc/h or Mpc). This sets the 
-        dimensions of the power spectrum as well as the fundamental frequency.
-    alpha: float (optional; default 0)
-        Optional float that allows for momentum weighted power spectra. Used 
-        in squeezed bispectrum modelling.
-    nthreads: integer
-        Number of threads for the outer loop over grid indices and for FFTs.
-
-    Returns
-    -------
-    k_bin: float
-        Average value of all Fourier modes used in this bin in units of 
-        1/box_len~h/Mpc.
-    Pk: float
-        Power spectrum in units of [Vol]=[box_len]^3~(Mpc/h)^3.
-    Nmodes: float
-        Number of modes in the Fourier bin. Technically this should be an
-        integer, but we keep it as a float.
-    """
-
-    cdef int ng, i, j, k
-    cdef double signal, pairs, Pk, Nmodes, k_bin
-    cdef np.complex64_t[:,:,::1] delta_k1, Ik1 # Fourier space fields
-    cdef np.float32_t[:,:,::1] delta1, I1      # Real space fields
-
-    ng   = delta_k.shape[0]
-    delta_k1, Ik1, k_bin = pick_field(delta_k, k_min, k_max, nthreads, 
-                                      alpha=alpha/2, return_k_bin=True)
-    
-    # Compute FFT
-    delta1 = IFFT3Dr_f(delta_k1, nthreads)
-    del delta_k1
-    I1     = IFFT3Dr_f(Ik1, nthreads)
-    del Ik1
-
-    # Calculate sum and normalization
-    signal, pairs = 0.0, 0.0
-
-    for i in prange(ng, nogil=True, num_threads=1):
-        for j in range(ng):
-            for k in range(ng):
-                signal += (delta1[i,j,k]*delta1[i,j,k])
-                pairs  += (I1[i,j,k]*I1[i,j,k])
-    
-    # Normalize results 
-    Pk     = (signal/pairs)*(box_len/ng**2)**3
-    Nmodes = 0.5*pairs*ng**3 # Factor of 2 because real space double counts kz 
-    k_bin  = k_bin*(2*pi/box_len)
-
-    del delta1; del I1
-    
-    return k_bin, Pk, Nmodes
-
-
-@cython.boundscheck(False)
-@cython.cdivision(False)
-@cython.wraparound(False)
-def compute_xPk3D_single(np.complex64_t[:,:,::1] delta_ka, 
-                         np.complex64_t[:,:,::1] delta_kb, int k_min, int k_max,
-                         double box_len, int nthreads,  double alpha=0):
-    """
-    Computes 3D auto power power spectrum of a density field in a single bin 
-    between [k_min, k_max) where k_min and k_max are in units of kf.
-
-    Parameters
-    ----------
-    delta_ka: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field.
-    delta_kb: (Ngrid, Ngrid, Ngrid//2+1) complex array
-        Fourier space density field.
-    k_min: int
-        Minimum wave number in units of kf=2pi/box_len.
-    k_max: int 
-        Maximum wave number in units of kf=2pi/box_len.
-    box_len: float 
-        Length of the box (typically in units of Mpc/h or Mpc). This sets the 
-        dimensions of the power spectrum as well as the fundamental frequency.
-    alpha: float (optional; default 0)
-        Optional float that allows for momentum weighted power spectra. Used 
-        in squeezed bispectrum modelling.
-    nthreads: integer
-        Number of threads for the outer loop over grid indices and for FFTs.
-
-    Returns
-    -------
-    k_bin: float
-        Average value of all Fourier modes used in this bin in units of 
-        1/box_len~h/Mpc.
-    Pk: float
-        Power spectrum in units of [Vol]=[box_len]^3~(Mpc/h)^3.
-    Nmodes: float
-        Number of modes in the Fourier bin. Technically this should be an
-        integer, but we keep it as a float.
-    """
-
-    cdef int ng, i, j, k
-    cdef double signal, pairs, Pk, Nmodes, k_bin
-    cdef np.complex64_t[:,:,::1] delta_ka_k1, delta_kb_k1, Ik1 # Fourier space fields
-    cdef np.float32_t[:,:,::1] delta_xa_k1, delta_xb_k1, Ix1      # Real space fields
-
-    ng   = delta_ka.shape[0]
-    delta_ka_k1, Ik1, k_bin = pick_field(delta_ka, k_min, k_max, nthreads, 
-                                         alpha=alpha/2, return_k_bin=True)
-    delta_kb_k1, _, _ = pick_field(delta_kb, k_min, k_max, nthreads, 
-                                   alpha=alpha/2, return_k_bin=True)
-    
-    del delta_ka, delta_kb
-
-    # Compute FFT
-    delta_xa_k1 = IFFT3Dr_f(delta_ka_k1, nthreads)
-    del delta_ka_k1
-    delta_xb_k1 = IFFT3Dr_f(delta_kb_k1, nthreads)
-    del delta_kb_k1
-    Ix1     = IFFT3Dr_f(Ik1, nthreads)
-    del Ik1
-
-    # Calculate sum and normalization
-    signal, pairs = 0.0, 0.0
-
-    for i in prange(ng, nogil=True, num_threads=1):
-        for j in range(ng):
-            for k in range(ng):
-                signal += (delta_xa_k1[i,j,k]*delta_xb_k1[i,j,k])
-                pairs  += (Ix1[i,j,k]*Ix1[i,j,k])
-    
-    # Clean up
-    del delta_xa_k1, delta_xa_k1, Ix1
-
-    # Normalize results 
-    Pk     = (signal/pairs)*(box_len/ng**2)**3
-    norm   = pairs # Factor of 2 because real space double counts kz 
-    k_bin  = k_bin*(2*pi/box_len)
-    
-    return k_bin, Pk, pairs
-
-
 @cython.boundscheck(False)
 @cython.cdivision(False)
 @cython.wraparound(False)
@@ -859,13 +632,17 @@ def compute_bk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
         Maximum wave number for the ith leg in units of kf=2pi/box_len.
     dki: int
         Bin spacing for the ith leg in units of kf.
-
     box_len: float 
-        Length of the bo
-        x (typically in units of Mpc/h or Mpc). This sets the 
+        Length of the box (typically in units of Mpc/h or Mpc). This sets the 
         dimensions of the power spectrum as well as the fundamental frequency.
     nthreads: integer
         Number of threads for the outer loop over grid indices and for FFTs.
+    verbose: bool (optional; default False)
+        Sets verbosity
+    Bq_norm_arr: float array (optional; default None)
+        Number of triangles in each Fourier bin. This is the normalization of
+        the estimator. Only needs to be computed once for a fixed set of 
+        triangle configurations, box length, and grid size.
 
     Returns
     -------
@@ -1091,7 +868,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
                          int nthreads, int k3_min=0, int k3_max=1000000,
                          np.ndarray[np.float32_t, ndim=1] Bqnorm_arr=None):
     """
-    Computes angular averaged bispectrum estimator used in 2209.06228. This is
+    Computes angular averaged bispectrum estimator used in ADD REF. This is
     a squeezed bispectrum binned in the soft mode k1=q and integrated over hard
     modes k2 in [k_min, k_max) and 0<k3<infty subject to triangle inequality.
 
@@ -1224,12 +1001,7 @@ def compute_bk3d_ang_avg(np.complex64_t[:,:,::1] delta_k, int q_min, int q_max,
 
 ################################################################################
 # Trispectrum routines
-# -> Includes routine to compute trispectrum binned in k12 and integrated over
-#    k12.
 ################################################################################
-"""
-Trispectrum estimator binned in k12
-"""
 @cython.boundscheck(False)
 @cython.cdivision(False)
 @cython.wraparound(False)
@@ -1242,11 +1014,11 @@ def compute_tk3d(np.complex64_t[:,:,::1] delta_k, int k1_min, int k1_max,
                  np.ndarray[np.float32_t, ndim=1] Tk_disc_PP_arr=None,
                  np.ndarray[np.float32_t, ndim=1] Ntet_arr=None):
     """
-    Cython implementation of the binned trispectrum estimator. For an input of 
-    minimum and maximum wavenumbers as well as bin spacing, the code computes
-    the trispectrum in all possible bins subject to:
+    Computes binned trispectrum estimator described in ADD REFERENCE. For an 
+    input of minimum and maximum wavenumbers as well as bin spacing, the code 
+    computes the trispectrum in all possible bins subject to:
     * k1 ≤ k2
-    * k2 ≤ k3, (Will's paper uses k1≤k3)
+    * k2 ≤ k3,
     * k3 ≤ k4,
     * |k1-k2| ≤ k1+k2,
     * |k3-k4| ≤ k3+k4.
