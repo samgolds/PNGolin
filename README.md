@@ -8,4 +8,6 @@ After cloning the repository, PNGolin can be installed by running \texttt{pip in
 ## Dependencies
 * cython, pyfftw
 
+Additionally, it is useful to have \href{Pylians}{https://pylians3.readthedocs.io/en/master/} installed. This isn't required for the code, but it is useful for reading in density fields.
+
 
